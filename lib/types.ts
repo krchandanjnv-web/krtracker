@@ -11,6 +11,8 @@ export type TaskRow = {
   task_date: string | null;
   due_date: string | null;
   target_per_week: number | null;
+  recurrence_days: number | null;
+  completion_dates: string[] | null;
   completed_at: string | null;
   created_at: string;
 };
@@ -30,6 +32,14 @@ export type TaskFormState = {
   taskDate: string;
   dueDate: string;
   targetPerWeek: number;
+  recurrenceDays: "none" | "5" | "6" | "7";
+};
+
+export type PlannerTask = TaskRow & {
+  displayDate: string | null;
+  isDoneToday: boolean;
+  daysLeft: number | null;
+  cadenceLabel: string | null;
 };
 
 export type DateRange = {
