@@ -14,7 +14,7 @@ import {
   Target,
   UserCircle2
 } from "lucide-react";
-import { format, isWithinInterval, parseISO } from "date-fns";
+import { format, parseISO } from "date-fns";
 import {
   Bar,
   BarChart,
@@ -30,10 +30,22 @@ import {
   YAxis
 } from "recharts";
 import clsx from "clsx";
-import { getDefaultDateRange, buildDailyChart, buildKpis, buildMonthlyChart, buildTaskTypeChart, buildTaskWiseProgress } from "@/lib/metrics";
+import {
+  buildDailyChart,
+  buildKpis,
+  buildMonthlyChart,
+  buildPlannerTask,
+  buildTaskTypeChart,
+  buildTaskWiseProgress,
+  getDefaultDateRange,
+  getTaskDisplayDate,
+  isDateInRange,
+  isTaskScheduledForDay,
+  isRecurringDailyTask
+} from "@/lib/metrics";
 import { exportTasksPdf } from "@/lib/pdf";
 import { getSupabaseBrowserClient } from "@/lib/supabase";
-import type { DateRange, ProfileRow, TaskFormState, TaskRow, TaskKind } from "@/lib/types";
+import type { DateRange, PlannerTask, ProfileRow, TaskFormState, TaskRow, TaskKind } from "@/lib/types";
 
 type SessionUser = {
   id: string;
@@ -50,7 +62,8 @@ const emptyTaskForm: TaskFormState = {
   kind: "daily",
   taskDate: format(new Date(), "yyyy-MM-dd"),
   dueDate: format(new Date(), "yyyy-MM-dd"),
-  targetPerWeek: 5
+  targetPerWeek: 5,
+  recurrenceDays: "none"
 };
 
 const typeColors = ["#1b4d3e", "#e78a2d", "#3f7dff"];
@@ -257,9 +270,15 @@ export function TrackerApp() {
       details: taskForm.details || null,
       category: taskForm.category || null,
       kind: taskForm.kind,
-      task_date: taskForm.kind !== "upcoming" ? taskForm.taskDate : null,
+      task_date: taskForm.kind === "upcoming" ? null : taskForm.taskDate,
       due_date: taskForm.kind !== "daily" ? taskForm.dueDate : null,
       target_per_week: taskForm.kind === "habit" ? taskForm.targetPerWeek : null
+      ,
+      recurrence_days:
+        taskForm.kind === "daily" && taskForm.recurrenceDays !== "none"
+          ? Number(taskForm.recurrenceDays)
+          : null,
+      completion_dates: []
     };
 
     const { error } = await supabase.from("tasks").insert(payload);
@@ -278,9 +297,16 @@ export function TrackerApp() {
     if (!supabase || !user) return;
 
     startTransition(async () => {
-      const updates = {
-        completed_at: task.completed_at ? null : new Date().toISOString()
-      };
+      const todayText = format(new Date(), "yyyy-MM-dd");
+      const updates = isRecurringDailyTask(task)
+        ? {
+            completion_dates: task.completion_dates?.includes(todayText)
+              ? task.completion_dates.filter((value) => value !== todayText)
+              : [...(task.completion_dates ?? []), todayText]
+          }
+        : {
+            completed_at: task.completed_at ? null : new Date().toISOString()
+          };
 
       const { error } = await supabase.from("tasks").update(updates).eq("id", task.id).eq("user_id", user.id);
 
@@ -303,10 +329,14 @@ export function TrackerApp() {
     const to = parseISO(dateRange.to);
 
     return tasks.filter((task) => {
-      const checkDate = task.task_date ?? task.due_date ?? task.created_at;
-      return isWithinInterval(parseISO(checkDate), { start: from, end: to });
+      const checkDate = getTaskDisplayDate(task) ?? task.created_at;
+      return isDateInRange(checkDate, from, to);
     });
   }, [dateRange, tasks]);
+  const filteredExportPlannerTasks = useMemo(
+    () => filteredExportTasks.map(buildPlannerTask).sort(sortPlannerTasks),
+    [filteredExportTasks]
+  );
 
   const kpis = useMemo(() => buildKpis(tasks), [tasks]);
   const dailyChart = useMemo(() => buildDailyChart(tasks), [tasks]);
@@ -315,12 +345,30 @@ export function TrackerApp() {
   const taskWiseProgress = useMemo(() => buildTaskWiseProgress(tasks), [tasks]);
 
   const plannerGroups = useMemo(() => {
-    const today = format(new Date(), "yyyy-MM-dd");
+    const today = new Date();
+    const todayText = format(today, "yyyy-MM-dd");
+    const enriched = tasks.map(buildPlannerTask);
+
     return {
-      daily: tasks.filter((task) => task.kind === "daily").sort(sortByDate),
-      habits: tasks.filter((task) => task.kind === "habit").sort(sortByDate),
-      upcoming: tasks.filter((task) => task.kind === "upcoming").sort(sortByDate),
-      todayCount: tasks.filter((task) => task.task_date === today).length
+      daily: enriched
+        .filter((task) =>
+          task.kind === "daily" &&
+          (task.recurrence_days
+            ? task.cadenceLabel && isTaskVisibleToday(task)
+            : task.task_date === todayText)
+        )
+        .sort(sortPlannerTasks),
+      habits: enriched.filter((task) => task.kind === "habit").sort(sortPlannerTasks),
+      upcoming: enriched.filter((task) => task.kind === "upcoming").sort(sortPlannerTasks),
+      todayCount: enriched.filter((task) =>
+        task.kind === "daily"
+          ? task.recurrence_days
+            ? isTaskVisibleToday(task)
+            : task.task_date === todayText
+          : task.kind === "habit"
+            ? task.task_date === todayText
+            : false
+      ).length
     };
   }, [tasks]);
 
@@ -554,6 +602,25 @@ export function TrackerApp() {
                   />
                 </label>
               </div>
+              {taskForm.kind === "daily" ? (
+                <label>
+                  Repeat schedule
+                  <select
+                    value={taskForm.recurrenceDays}
+                    onChange={(event) =>
+                      setTaskForm((prev) => ({
+                        ...prev,
+                        recurrenceDays: event.target.value as TaskFormState["recurrenceDays"]
+                      }))
+                    }
+                  >
+                    <option value="none">One manual daily task</option>
+                    <option value="5">Mon to Fri auto-refresh</option>
+                    <option value="6">Mon to Sat auto-refresh</option>
+                    <option value="7">Mon to Sun auto-refresh</option>
+                  </select>
+                </label>
+              ) : null}
               {taskForm.kind === "habit" ? (
                 <label>
                   Habit target per week
@@ -576,7 +643,7 @@ export function TrackerApp() {
           </article>
 
           <article className="panel table-panel">
-            <SectionTitle title="Daily tasks" subtitle="Short, one-day items for the current routine." />
+            <SectionTitle title="Daily tasks" subtitle="Manual one-day items plus weekday-based auto-refresh routines." />
             <TaskTable tasks={plannerGroups.daily} onToggle={toggleTask} pending={pending} />
           </article>
 
@@ -586,7 +653,7 @@ export function TrackerApp() {
           </article>
 
           <article className="panel table-panel">
-            <SectionTitle title="Upcoming tasks" subtitle="Future work with a due date and clear visibility." />
+            <SectionTitle title="Upcoming tasks" subtitle="Future work with due dates and a live days-left count." />
             <TaskTable tasks={plannerGroups.upcoming} onToggle={toggleTask} pending={pending} />
           </article>
         </section>
@@ -732,7 +799,7 @@ export function TrackerApp() {
 
           <article className="panel table-panel full-width">
             <SectionTitle title="Export preview" subtitle="The rows that will be included in your PDF file." />
-            <TaskTable tasks={filteredExportTasks} onToggle={toggleTask} pending={pending} />
+            <TaskTable tasks={filteredExportPlannerTasks} onToggle={toggleTask} pending={pending} />
           </article>
         </section>
       ) : null}
@@ -776,7 +843,7 @@ function TaskTable({
   onToggle,
   pending
 }: {
-  tasks: TaskRow[];
+  tasks: PlannerTask[];
   onToggle: (task: TaskRow) => void;
   pending: boolean;
 }) {
@@ -792,7 +859,9 @@ function TaskTable({
             <th>Task</th>
             <th>Type</th>
             <th>Date</th>
+            <th>Pattern</th>
             <th>Category</th>
+            <th>Days left</th>
             <th>Status</th>
           </tr>
         </thead>
@@ -810,10 +879,12 @@ function TaskTable({
               </td>
               <td>{task.kind}</td>
               <td>{formatTaskDate(task)}</td>
+              <td>{task.cadenceLabel ?? "-"}</td>
               <td>{task.category ?? "-"}</td>
+              <td>{formatDaysLeft(task.daysLeft)}</td>
               <td>
-                <span className={clsx("status-pill", task.completed_at ? "done" : "pending")}>
-                  {task.completed_at ? "Done" : "Pending"}
+                <span className={clsx("status-pill", task.isDoneToday || task.completed_at ? "done" : "pending")}>
+                  {task.isDoneToday || task.completed_at ? "Done" : "Pending"}
                 </span>
               </td>
             </tr>
@@ -824,13 +895,37 @@ function TaskTable({
   );
 }
 
-function formatTaskDate(task: TaskRow) {
-  const value = task.task_date ?? task.due_date;
+function formatTaskDate(task: PlannerTask) {
+  const value = task.displayDate;
   return value ? format(parseISO(value), "dd MMM yyyy") : "-";
 }
 
-function sortByDate(a: TaskRow, b: TaskRow) {
-  const left = a.task_date ?? a.due_date ?? a.created_at;
-  const right = b.task_date ?? b.due_date ?? b.created_at;
+function sortPlannerTasks(a: PlannerTask, b: PlannerTask) {
+  const left = a.displayDate ?? a.created_at;
+  const right = b.displayDate ?? b.created_at;
   return parseISO(left).getTime() - parseISO(right).getTime();
+}
+
+function formatDaysLeft(daysLeft: number | null) {
+  if (daysLeft === null) {
+    return "-";
+  }
+
+  if (daysLeft < 0) {
+    return `${Math.abs(daysLeft)} overdue`;
+  }
+
+  if (daysLeft === 0) {
+    return "Today";
+  }
+
+  if (daysLeft === 1) {
+    return "1 day";
+  }
+
+  return `${daysLeft} days`;
+}
+
+function isTaskVisibleToday(task: PlannerTask) {
+  return isTaskScheduledForDay(task, new Date());
 }
