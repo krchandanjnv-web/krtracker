@@ -64,6 +64,7 @@ export function TrackerApp() {
   const [tasks, setTasks] = useState<TaskRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState<string>("");
+  const [networkError, setNetworkError] = useState<string>("");
   const [authForm, setAuthForm] = useState({
     username: "",
     email: "",
@@ -82,25 +83,32 @@ export function TrackerApp() {
     let active = true;
 
     const init = async () => {
-      const [{ data: sessionData }, profileData] = await Promise.all([
-        supabase.auth.getSession(),
-        Promise.resolve(null)
-      ]);
-      const currentUser = sessionData.session?.user;
+      try {
+        setNetworkError("");
+        const {
+          data: { session }
+        } = await supabase.auth.getSession();
+        const currentUser = session?.user;
 
-      if (!active) return;
+        if (!active) return;
 
-      if (currentUser) {
-        const nextUser = {
-          id: currentUser.id,
-          email: currentUser.email
-        };
-        setUser(nextUser);
-        await ensureProfile(nextUser, currentUser.user_metadata?.username);
-        await loadProfileAndTasks(currentUser.id);
+        if (currentUser) {
+          const nextUser = {
+            id: currentUser.id,
+            email: currentUser.email
+          };
+          setUser(nextUser);
+          await ensureProfile(nextUser, currentUser.user_metadata?.username);
+          await loadProfileAndTasks(currentUser.id);
+        }
+      } catch {
+        if (!active) return;
+        setNetworkError("Could not connect to Supabase. Please refresh and try again.");
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
       }
-
-      setLoading(false);
     };
 
     init();
@@ -110,18 +118,26 @@ export function TrackerApp() {
     } = supabase.auth.onAuthStateChange(async (_event, session) => {
       const currentUser = session?.user;
 
-      if (currentUser) {
-        const nextUser = {
-          id: currentUser.id,
-          email: currentUser.email
-        };
-        setUser(nextUser);
-        await ensureProfile(nextUser, currentUser.user_metadata?.username);
-        await loadProfileAndTasks(currentUser.id);
-      } else {
-        setUser(null);
-        setProfile(null);
-        setTasks([]);
+      try {
+        setNetworkError("");
+
+        if (currentUser) {
+          const nextUser = {
+            id: currentUser.id,
+            email: currentUser.email
+          };
+          setUser(nextUser);
+          await ensureProfile(nextUser, currentUser.user_metadata?.username);
+          await loadProfileAndTasks(currentUser.id);
+        } else {
+          setUser(null);
+          setProfile(null);
+          setTasks([]);
+        }
+      } catch {
+        setNetworkError("Session updated, but data could not be loaded. Please refresh.");
+      } finally {
+        setLoading(false);
       }
     });
 
@@ -134,10 +150,18 @@ export function TrackerApp() {
   async function loadProfileAndTasks(userId: string) {
     if (!supabase) return;
 
-    const [{ data: profileData }, { data: taskData }] = await Promise.all([
+    const [{ data: profileData, error: profileError }, { data: taskData, error: taskError }] = await Promise.all([
       supabase.from("profiles").select("*").eq("id", userId).maybeSingle(),
       supabase.from("tasks").select("*").eq("user_id", userId).order("created_at", { ascending: false })
     ]);
+
+    if (profileError) {
+      throw profileError;
+    }
+
+    if (taskError) {
+      throw taskError;
+    }
 
     setProfile(profileData ?? null);
     setTasks(taskData ?? []);
@@ -318,7 +342,10 @@ export function TrackerApp() {
   if (loading) {
     return (
       <main className="page-shell loading-shell">
-        <LoaderCircle className="spin" />
+        <div className="loading-stack">
+          <LoaderCircle className="spin" />
+          {networkError ? <p className="form-message">{networkError}</p> : null}
+        </div>
       </main>
     );
   }
@@ -408,6 +435,7 @@ export function TrackerApp() {
               {authMode === "login" ? "Enter workspace" : "Create account"}
             </button>
           </form>
+          {networkError ? <p className="form-message">{networkError}</p> : null}
           {message ? <p className="form-message">{message}</p> : null}
         </section>
       </main>
@@ -709,7 +737,8 @@ export function TrackerApp() {
         </section>
       ) : null}
 
-      {message ? <div className="status-toast">{message}</div> : null}
+      {networkError ? <div className="status-toast">{networkError}</div> : null}
+      {!networkError && message ? <div className="status-toast">{message}</div> : null}
     </main>
   );
 }
