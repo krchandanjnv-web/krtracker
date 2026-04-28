@@ -14,7 +14,7 @@ import {
   Target,
   UserCircle2
 } from "lucide-react";
-import { format, isWithinInterval, parseISO } from "date-fns";
+import { format, parseISO } from "date-fns";
 import {
   Bar,
   BarChart,
@@ -30,10 +30,22 @@ import {
   YAxis
 } from "recharts";
 import clsx from "clsx";
-import { getDefaultDateRange, buildDailyChart, buildKpis, buildMonthlyChart, buildTaskTypeChart, buildTaskWiseProgress } from "@/lib/metrics";
+import {
+  buildDailyChart,
+  buildKpis,
+  buildMonthlyChart,
+  buildPlannerTask,
+  buildTaskTypeChart,
+  buildTaskWiseProgress,
+  getDefaultDateRange,
+  getTaskDisplayDate,
+  isDateInRange,
+  isTaskScheduledForDay,
+  isRecurringDailyTask
+} from "@/lib/metrics";
 import { exportTasksPdf } from "@/lib/pdf";
 import { getSupabaseBrowserClient } from "@/lib/supabase";
-import type { DateRange, ProfileRow, TaskFormState, TaskRow, TaskKind } from "@/lib/types";
+import type { DateRange, PlannerTask, ProfileRow, TaskFormState, TaskRow, TaskKind } from "@/lib/types";
 
 type SessionUser = {
   id: string;
@@ -50,7 +62,8 @@ const emptyTaskForm: TaskFormState = {
   kind: "daily",
   taskDate: format(new Date(), "yyyy-MM-dd"),
   dueDate: format(new Date(), "yyyy-MM-dd"),
-  targetPerWeek: 5
+  targetPerWeek: 5,
+  recurrenceDays: "none"
 };
 
 const typeColors = ["#1b4d3e", "#e78a2d", "#3f7dff"];
@@ -64,6 +77,7 @@ export function TrackerApp() {
   const [tasks, setTasks] = useState<TaskRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState<string>("");
+  const [networkError, setNetworkError] = useState<string>("");
   const [authForm, setAuthForm] = useState({
     username: "",
     email: "",
@@ -82,23 +96,32 @@ export function TrackerApp() {
     let active = true;
 
     const init = async () => {
-      const [{ data: sessionData }, profileData] = await Promise.all([
-        supabase.auth.getSession(),
-        Promise.resolve(null)
-      ]);
-      const currentUser = sessionData.session?.user;
+      try {
+        setNetworkError("");
+        const {
+          data: { session }
+        } = await supabase.auth.getSession();
+        const currentUser = session?.user;
 
-      if (!active) return;
+        if (!active) return;
 
-      if (currentUser) {
-        setUser({
-          id: currentUser.id,
-          email: currentUser.email
-        });
-        await loadProfileAndTasks(currentUser.id);
+        if (currentUser) {
+          const nextUser = {
+            id: currentUser.id,
+            email: currentUser.email
+          };
+          setUser(nextUser);
+          await ensureProfile(nextUser, currentUser.user_metadata?.username);
+          await loadProfileAndTasks(currentUser.id);
+        }
+      } catch {
+        if (!active) return;
+        setNetworkError("Could not connect to Supabase. Please refresh and try again.");
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
       }
-
-      setLoading(false);
     };
 
     init();
@@ -108,16 +131,26 @@ export function TrackerApp() {
     } = supabase.auth.onAuthStateChange(async (_event, session) => {
       const currentUser = session?.user;
 
-      if (currentUser) {
-        setUser({
-          id: currentUser.id,
-          email: currentUser.email
-        });
-        await loadProfileAndTasks(currentUser.id);
-      } else {
-        setUser(null);
-        setProfile(null);
-        setTasks([]);
+      try {
+        setNetworkError("");
+
+        if (currentUser) {
+          const nextUser = {
+            id: currentUser.id,
+            email: currentUser.email
+          };
+          setUser(nextUser);
+          await ensureProfile(nextUser, currentUser.user_metadata?.username);
+          await loadProfileAndTasks(currentUser.id);
+        } else {
+          setUser(null);
+          setProfile(null);
+          setTasks([]);
+        }
+      } catch {
+        setNetworkError("Session updated, but data could not be loaded. Please refresh.");
+      } finally {
+        setLoading(false);
       }
     });
 
@@ -130,13 +163,57 @@ export function TrackerApp() {
   async function loadProfileAndTasks(userId: string) {
     if (!supabase) return;
 
-    const [{ data: profileData }, { data: taskData }] = await Promise.all([
+    const [{ data: profileData, error: profileError }, { data: taskData, error: taskError }] = await Promise.all([
       supabase.from("profiles").select("*").eq("id", userId).maybeSingle(),
       supabase.from("tasks").select("*").eq("user_id", userId).order("created_at", { ascending: false })
     ]);
 
+    if (profileError) {
+      throw profileError;
+    }
+
+    if (taskError) {
+      throw taskError;
+    }
+
     setProfile(profileData ?? null);
     setTasks(taskData ?? []);
+  }
+
+  async function ensureProfile(currentUser: SessionUser, usernameHint?: string) {
+    if (!supabase) return null;
+
+    const { data: existingProfile } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", currentUser.id)
+      .maybeSingle();
+
+    if (existingProfile) {
+      return existingProfile;
+    }
+
+    const fallbackUsername =
+      usernameHint?.trim() ||
+      currentUser.email?.split("@")[0]?.replace(/[^a-zA-Z0-9_]/g, "_") ||
+      `user_${currentUser.id.slice(0, 8)}`;
+
+    const { data: createdProfile, error } = await supabase
+      .from("profiles")
+      .upsert({
+        id: currentUser.id,
+        email: currentUser.email ?? "",
+        username: fallbackUsername
+      })
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      setMessage(error.message);
+      return null;
+    }
+
+    return createdProfile;
   }
 
   async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
@@ -162,11 +239,13 @@ export function TrackerApp() {
       }
 
       if (data.user) {
-        await supabase.from("profiles").upsert({
-          id: data.user.id,
-          email: authForm.email,
-          username: authForm.username
-        });
+        await ensureProfile(
+          {
+            id: data.user.id,
+            email: authForm.email
+          },
+          authForm.username
+        );
       }
 
       setMessage("Account created. Check your email if confirmation is enabled.");
@@ -191,9 +270,15 @@ export function TrackerApp() {
       details: taskForm.details || null,
       category: taskForm.category || null,
       kind: taskForm.kind,
-      task_date: taskForm.kind !== "upcoming" ? taskForm.taskDate : null,
+      task_date: taskForm.kind === "upcoming" ? null : taskForm.taskDate,
       due_date: taskForm.kind !== "daily" ? taskForm.dueDate : null,
       target_per_week: taskForm.kind === "habit" ? taskForm.targetPerWeek : null
+      ,
+      recurrence_days:
+        taskForm.kind === "daily" && taskForm.recurrenceDays !== "none"
+          ? Number(taskForm.recurrenceDays)
+          : null,
+      completion_dates: []
     };
 
     const { error } = await supabase.from("tasks").insert(payload);
@@ -212,9 +297,16 @@ export function TrackerApp() {
     if (!supabase || !user) return;
 
     startTransition(async () => {
-      const updates = {
-        completed_at: task.completed_at ? null : new Date().toISOString()
-      };
+      const todayText = format(new Date(), "yyyy-MM-dd");
+      const updates = isRecurringDailyTask(task)
+        ? {
+            completion_dates: task.completion_dates?.includes(todayText)
+              ? task.completion_dates.filter((value) => value !== todayText)
+              : [...(task.completion_dates ?? []), todayText]
+          }
+        : {
+            completed_at: task.completed_at ? null : new Date().toISOString()
+          };
 
       const { error } = await supabase.from("tasks").update(updates).eq("id", task.id).eq("user_id", user.id);
 
@@ -237,10 +329,14 @@ export function TrackerApp() {
     const to = parseISO(dateRange.to);
 
     return tasks.filter((task) => {
-      const checkDate = task.task_date ?? task.due_date ?? task.created_at;
-      return isWithinInterval(parseISO(checkDate), { start: from, end: to });
+      const checkDate = getTaskDisplayDate(task) ?? task.created_at;
+      return isDateInRange(checkDate, from, to);
     });
   }, [dateRange, tasks]);
+  const filteredExportPlannerTasks = useMemo(
+    () => filteredExportTasks.map(buildPlannerTask).sort(sortPlannerTasks),
+    [filteredExportTasks]
+  );
 
   const kpis = useMemo(() => buildKpis(tasks), [tasks]);
   const dailyChart = useMemo(() => buildDailyChart(tasks), [tasks]);
@@ -249,12 +345,30 @@ export function TrackerApp() {
   const taskWiseProgress = useMemo(() => buildTaskWiseProgress(tasks), [tasks]);
 
   const plannerGroups = useMemo(() => {
-    const today = format(new Date(), "yyyy-MM-dd");
+    const today = new Date();
+    const todayText = format(today, "yyyy-MM-dd");
+    const enriched = tasks.map(buildPlannerTask);
+
     return {
-      daily: tasks.filter((task) => task.kind === "daily").sort(sortByDate),
-      habits: tasks.filter((task) => task.kind === "habit").sort(sortByDate),
-      upcoming: tasks.filter((task) => task.kind === "upcoming").sort(sortByDate),
-      todayCount: tasks.filter((task) => task.task_date === today).length
+      daily: enriched
+        .filter((task) =>
+          task.kind === "daily" &&
+          (task.recurrence_days
+            ? task.cadenceLabel && isTaskVisibleToday(task)
+            : task.task_date === todayText)
+        )
+        .sort(sortPlannerTasks),
+      habits: enriched.filter((task) => task.kind === "habit").sort(sortPlannerTasks),
+      upcoming: enriched.filter((task) => task.kind === "upcoming").sort(sortPlannerTasks),
+      todayCount: enriched.filter((task) =>
+        task.kind === "daily"
+          ? task.recurrence_days
+            ? isTaskVisibleToday(task)
+            : task.task_date === todayText
+          : task.kind === "habit"
+            ? task.task_date === todayText
+            : false
+      ).length
     };
   }, [tasks]);
 
@@ -276,7 +390,10 @@ export function TrackerApp() {
   if (loading) {
     return (
       <main className="page-shell loading-shell">
-        <LoaderCircle className="spin" />
+        <div className="loading-stack">
+          <LoaderCircle className="spin" />
+          {networkError ? <p className="form-message">{networkError}</p> : null}
+        </div>
       </main>
     );
   }
@@ -366,6 +483,7 @@ export function TrackerApp() {
               {authMode === "login" ? "Enter workspace" : "Create account"}
             </button>
           </form>
+          {networkError ? <p className="form-message">{networkError}</p> : null}
           {message ? <p className="form-message">{message}</p> : null}
         </section>
       </main>
@@ -484,6 +602,25 @@ export function TrackerApp() {
                   />
                 </label>
               </div>
+              {taskForm.kind === "daily" ? (
+                <label>
+                  Repeat schedule
+                  <select
+                    value={taskForm.recurrenceDays}
+                    onChange={(event) =>
+                      setTaskForm((prev) => ({
+                        ...prev,
+                        recurrenceDays: event.target.value as TaskFormState["recurrenceDays"]
+                      }))
+                    }
+                  >
+                    <option value="none">One manual daily task</option>
+                    <option value="5">Mon to Fri auto-refresh</option>
+                    <option value="6">Mon to Sat auto-refresh</option>
+                    <option value="7">Mon to Sun auto-refresh</option>
+                  </select>
+                </label>
+              ) : null}
               {taskForm.kind === "habit" ? (
                 <label>
                   Habit target per week
@@ -506,7 +643,7 @@ export function TrackerApp() {
           </article>
 
           <article className="panel table-panel">
-            <SectionTitle title="Daily tasks" subtitle="Short, one-day items for the current routine." />
+            <SectionTitle title="Daily tasks" subtitle="Manual one-day items plus weekday-based auto-refresh routines." />
             <TaskTable tasks={plannerGroups.daily} onToggle={toggleTask} pending={pending} />
           </article>
 
@@ -516,7 +653,7 @@ export function TrackerApp() {
           </article>
 
           <article className="panel table-panel">
-            <SectionTitle title="Upcoming tasks" subtitle="Future work with a due date and clear visibility." />
+            <SectionTitle title="Upcoming tasks" subtitle="Future work with due dates and a live days-left count." />
             <TaskTable tasks={plannerGroups.upcoming} onToggle={toggleTask} pending={pending} />
           </article>
         </section>
@@ -662,12 +799,13 @@ export function TrackerApp() {
 
           <article className="panel table-panel full-width">
             <SectionTitle title="Export preview" subtitle="The rows that will be included in your PDF file." />
-            <TaskTable tasks={filteredExportTasks} onToggle={toggleTask} pending={pending} />
+            <TaskTable tasks={filteredExportPlannerTasks} onToggle={toggleTask} pending={pending} />
           </article>
         </section>
       ) : null}
 
-      {message ? <div className="status-toast">{message}</div> : null}
+      {networkError ? <div className="status-toast">{networkError}</div> : null}
+      {!networkError && message ? <div className="status-toast">{message}</div> : null}
     </main>
   );
 }
@@ -705,7 +843,7 @@ function TaskTable({
   onToggle,
   pending
 }: {
-  tasks: TaskRow[];
+  tasks: PlannerTask[];
   onToggle: (task: TaskRow) => void;
   pending: boolean;
 }) {
@@ -721,7 +859,9 @@ function TaskTable({
             <th>Task</th>
             <th>Type</th>
             <th>Date</th>
+            <th>Pattern</th>
             <th>Category</th>
+            <th>Days left</th>
             <th>Status</th>
           </tr>
         </thead>
@@ -739,10 +879,12 @@ function TaskTable({
               </td>
               <td>{task.kind}</td>
               <td>{formatTaskDate(task)}</td>
+              <td>{task.cadenceLabel ?? "-"}</td>
               <td>{task.category ?? "-"}</td>
+              <td>{formatDaysLeft(task.daysLeft)}</td>
               <td>
-                <span className={clsx("status-pill", task.completed_at ? "done" : "pending")}>
-                  {task.completed_at ? "Done" : "Pending"}
+                <span className={clsx("status-pill", task.isDoneToday || task.completed_at ? "done" : "pending")}>
+                  {task.isDoneToday || task.completed_at ? "Done" : "Pending"}
                 </span>
               </td>
             </tr>
@@ -753,13 +895,37 @@ function TaskTable({
   );
 }
 
-function formatTaskDate(task: TaskRow) {
-  const value = task.task_date ?? task.due_date;
+function formatTaskDate(task: PlannerTask) {
+  const value = task.displayDate;
   return value ? format(parseISO(value), "dd MMM yyyy") : "-";
 }
 
-function sortByDate(a: TaskRow, b: TaskRow) {
-  const left = a.task_date ?? a.due_date ?? a.created_at;
-  const right = b.task_date ?? b.due_date ?? b.created_at;
+function sortPlannerTasks(a: PlannerTask, b: PlannerTask) {
+  const left = a.displayDate ?? a.created_at;
+  const right = b.displayDate ?? b.created_at;
   return parseISO(left).getTime() - parseISO(right).getTime();
+}
+
+function formatDaysLeft(daysLeft: number | null) {
+  if (daysLeft === null) {
+    return "-";
+  }
+
+  if (daysLeft < 0) {
+    return `${Math.abs(daysLeft)} overdue`;
+  }
+
+  if (daysLeft === 0) {
+    return "Today";
+  }
+
+  if (daysLeft === 1) {
+    return "1 day";
+  }
+
+  return `${daysLeft} days`;
+}
+
+function isTaskVisibleToday(task: PlannerTask) {
+  return isTaskScheduledForDay(task, new Date());
 }
